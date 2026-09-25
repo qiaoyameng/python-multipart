@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 class FormParserError(ValueError):
     """Base error class for our form parser."""
 
@@ -5,11 +8,20 @@ class FormParserError(ValueError):
 class ParseError(FormParserError):
     """This exception (or a subclass) is raised when there is an error while
     parsing something.
+
+    Attributes:
+        offset: The byte offset at which the error was detected. For errors raised while
+            writing a chunk this is relative to that chunk; for errors raised by
+            [`MultipartParser.finalize`][python_multipart.MultipartParser.finalize] it is the
+            absolute byte position within the whole input stream. -1 if unknown.
+        phase: The phase of parsing during which the error occurred (e.g. "headers",
+            "part_data" or "boundary" for multipart messages), or None if not applicable.
     """
 
-    def __init__(self, message: str, *, offset: int = -1) -> None:
+    def __init__(self, message: str, *, offset: int = -1, phase: str | None = None) -> None:
         super().__init__(message)
         self.offset = offset
+        self.phase = phase
 
 
 class MultipartParseError(ParseError):

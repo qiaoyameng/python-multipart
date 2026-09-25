@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import yaml
@@ -1629,6 +1629,306 @@ class TestFormParser(unittest.TestCase):
 
 
 @parametrize_class
+class TestMultipartStrictFinalize(unittest.TestCase):
+    """Tests for MultipartParser's optional strict end-of-message check
+    (require_terminator=True)."""
+
+    MESSAGE = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="field"\r\n'
+        b"\r\n"
+        b"value\r\n"
+        b"--boundary--\r\n"
+    )
+
+    NOTIFY_CALLBACKS = ("part_begin", "part_end", "header_begin", "header_end", "headers_finished", "end")
+    DATA_CALLBACKS = ("header_field", "header_value", "part_data")
+
+    CHUNK_SIZES = (1, 2, 3, 5, 7, 13)
+
+    def make_parser(
+        self, **kwargs: Any
+    ) -> tuple[MultipartParser, dict[str, int], dict[str, list[bytes]]]:
+        counts = {name: 0 for name in self.NOTIFY_CALLBACKS}
+        data_parts: dict[str, list[bytes]] = {name: [] for name in self.DATA_CALLBACKS}
+
+        callbacks: dict[str, Any] = {}
+        for name in self.NOTIFY_CALLBACKS:
+
+            def notify(name: str = name) -> None:
+                counts[name] += 1
+
+            callbacks["on_" + name] = notify
+        for name in self.DATA_CALLBACKS:
+
+            def collect(data: bytes, start: int, end: int, name: str = name) -> None:
+                data_parts[name].append(data[start:end])
+
+            callbacks["on_" + name] = collect
+
+        parser = MultipartParser(b"boundary", callbacks, **kwargs)
+        return parser, counts, data_parts
+
+    def write_chunked(self, parser: MultipartParser, data: bytes, chunk_size: int) -> None:
+        for i in range(0, len(data), chunk_size):
+            parser.write(data[i : i + chunk_size])
+
+    def assert_truncation(self, data: bytes, expected_phase: str) -> None:
+        """The same truncated message, fed in many different chunkings, must
+        fail with the same error type, absolute offset, phase and callback
+        counts."""
+        expected: tuple[dict[str, int], dict[str, bytes]] | None = None
+        for chunk_size in (*self.CHUNK_SIZES, len(data)):
+            parser, counts, data_parts = self.make_parser(require_terminator=True)
+            self.write_chunked(parser, data, chunk_size)
+            with self.assertRaises(MultipartParseError) as cm:
+                parser.finalize()
+            # The offset is the absolute position within the whole input,
+            # regardless of how the input was split across write() calls.
+            self.assertEqual(cm.exception.offset, len(data))
+            self.assertEqual(cm.exception.phase, expected_phase)
+            # Notification callback counts and reassembled data must not
+            # depend on the chunking.
+            result = (counts, {name: b"".join(parts) for name, parts in data_parts.items()})
+            if expected is None:
+                expected = result
+            else:
+                self.assertEqual(result, expected, f"chunk_size={chunk_size}")
+
+    def test_truncated_headers(self) -> None:
+        cut = self.MESSAGE.index(b"form-data") + 3
+        self.assert_truncation(self.MESSAGE[:cut], "headers")
+
+    def test_truncated_part_data(self) -> None:
+        cut = self.MESSAGE.index(b"value") + 2
+        self.assert_truncation(self.MESSAGE[:cut], "part_data")
+
+    def test_truncated_terminating_boundary(self) -> None:
+        idx = self.MESSAGE.index(b"\r\n--boundary--")
+        # Partial boundary, full boundary without hyphens, single hyphen.
+        for cut in (idx + 5, idx + 12, idx + 13):
+            with self.subTest(cut=cut):
+                self.assert_truncation(self.MESSAGE[:cut], "boundary")
+
+    def test_truncated_initial_boundary(self) -> None:
+        self.assert_truncation(self.MESSAGE[:5], "boundary")
+
+    def test_empty_input(self) -> None:
+        parser, _, _ = self.make_parser(require_terminator=True)
+        with self.assertRaises(MultipartParseError) as cm:
+            parser.finalize()
+        self.assertEqual(cm.exception.offset, 0)
+        self.assertEqual(cm.exception.phase, "boundary")
+
+    def test_clean_end_and_repeated_finalize(self) -> None:
+        for chunk_size in (*self.CHUNK_SIZES, len(self.MESSAGE)):
+            parser, counts, data_parts = self.make_parser(require_terminator=True)
+            self.write_chunked(parser, self.MESSAGE, chunk_size)
+            # Repeated finalize on a completed message is a no-op.
+            parser.finalize()
+            parser.finalize()
+            parser.finalize()
+            self.assertEqual(counts["end"], 1)
+            self.assertEqual(counts["part_begin"], 1)
+            self.assertEqual(counts["part_end"], 1)
+            self.assertEqual(counts["headers_finished"], 1)
+            self.assertEqual(b"".join(data_parts["part_data"]), b"value")
+            self.assertEqual(b"".join(data_parts["header_field"]), b"Content-Disposition")
+
+    def test_terminator_without_trailing_crlf(self) -> None:
+        parser, counts, _ = self.make_parser(require_terminator=True)
+        self.write_chunked(parser, self.MESSAGE[:-2], 3)
+        parser.finalize()
+        self.assertEqual(counts["end"], 1)
+
+    def test_empty_message(self) -> None:
+        for data in (b"--boundary--", b"--boundary--\r\n"):
+            parser, counts, _ = self.make_parser(require_terminator=True)
+            parser.write(data)
+            parser.finalize()
+            parser.finalize()
+            self.assertEqual(counts["end"], 1)
+            self.assertEqual(counts["part_begin"], 0)
+
+    def test_epilogue_accepted(self) -> None:
+        data = self.MESSAGE + b"epilogue data\r\n--boundary\r\nnot a real part"
+        parser, counts, _ = self.make_parser(require_terminator=True)
+        self.write_chunked(parser, data, 5)
+        parser.finalize()
+        self.assertEqual(counts["end"], 1)
+        self.assertEqual(counts["part_begin"], 1)
+
+    def test_lenient_by_default(self) -> None:
+        cut = self.MESSAGE.index(b"value") + 2
+        parser, _, _ = self.make_parser()
+        parser.write(self.MESSAGE[:cut])
+        # Without require_terminator, finalize() accepts truncated input.
+        parser.finalize()
+
+    def test_repeated_finalize_failure_is_deterministic(self) -> None:
+        cut = self.MESSAGE.index(b"value") + 2
+        parser, _, _ = self.make_parser(require_terminator=True)
+        self.write_chunked(parser, self.MESSAGE[:cut], 4)
+        with self.assertRaises(MultipartParseError) as cm1:
+            parser.finalize()
+        with self.assertRaises(MultipartParseError) as cm2:
+            parser.finalize()
+        self.assertEqual(cm1.exception.offset, cm2.exception.offset)
+        self.assertEqual(cm1.exception.phase, cm2.exception.phase)
+        self.assertEqual(str(cm1.exception), str(cm2.exception))
+
+    def test_callback_exception_not_wrapped(self) -> None:
+        class CustomError(Exception):
+            pass
+
+        exc = CustomError("boom")
+
+        def on_part_data(data: bytes, start: int, end: int) -> None:
+            raise exc
+
+        parser = MultipartParser(b"boundary", {"on_part_data": on_part_data}, require_terminator=True)
+        with self.assertRaises(CustomError) as cm:
+            parser.write(self.MESSAGE)
+        # The original exception propagates with its chain intact; it is not
+        # wrapped into a protocol error.
+        self.assertIs(cm.exception, exc)
+        self.assertIsNone(cm.exception.__context__)
+
+
+class TestFormParserFailureHandling(unittest.TestCase):
+    """Tests for FormParser's handling of incomplete parts when parsing fails."""
+
+    COMPLETE_MESSAGE = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="field"\r\n'
+        b"\r\n"
+        b"value\r\n"
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="file.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"file-content\r\n"
+        b"--boundary--\r\n"
+    )
+
+    def make_parser(
+        self, fields: list[Field] | None, files: list[File] | None, **config: Any
+    ) -> FormParser:
+        return FormParser(
+            "multipart/form-data",
+            fields.append if fields is not None else None,
+            files.append if files is not None else None,
+            boundary="boundary",
+            config=config,
+        )
+
+    def test_incomplete_file_discarded_on_finalize_failure(self) -> None:
+        cut = self.COMPLETE_MESSAGE.index(b"file-content") + 4
+        data = self.COMPLETE_MESSAGE[:cut]
+        fields: list[Field] = []
+        files: list[File] = []
+        parser = self.make_parser(fields, files, REQUIRE_TERMINATOR=True)
+        with patch.object(File, "close", autospec=True) as mock_close:
+            parser.write(data)
+            with self.assertRaises(MultipartParseError) as cm:
+                parser.finalize()
+        self.assertEqual(cm.exception.offset, len(data))
+        self.assertEqual(cm.exception.phase, "part_data")
+        # The completed field was delivered; the incomplete file was not.
+        self.assertEqual([f.field_name for f in fields], [b"field"])
+        self.assertEqual(files, [])
+        # The incomplete file was finalized and closed internally.
+        mock_close.assert_called_once()
+
+    def test_completed_parts_untouched_by_failure(self) -> None:
+        data = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n'
+            b"\r\n"
+            b"content\r\n"
+            b"--boundary\r\n"
+            b"Content-Disposition: form-da"  # truncated second header
+        )
+        files: list[File] = []
+        parser = self.make_parser(None, files, REQUIRE_TERMINATOR=True)
+        parser.write(data)
+        with self.assertRaises(MultipartParseError) as cm:
+            parser.finalize()
+        self.assertEqual(cm.exception.offset, len(data))
+        self.assertEqual(cm.exception.phase, "headers")
+        # The completed file was delivered before the failure and belongs to
+        # the caller: the parser does not close or modify it.
+        self.assertEqual(len(files), 1)
+        self.assertFalse(files[0].file_object.closed)
+        files[0].file_object.seek(0)
+        self.assertEqual(files[0].file_object.read(), b"content")
+        files[0].close()
+
+    def test_incomplete_file_discarded_on_write_failure(self) -> None:
+        data = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n'
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"\r\n"
+            b"!invalid base64!"
+        )
+        files: list[File] = []
+        parser = self.make_parser(None, files, REQUIRE_TERMINATOR=True)
+        with patch.object(File, "close", autospec=True) as mock_close:
+            with self.assertRaises(DecodeError):
+                parser.write(data)
+        self.assertEqual(files, [])
+        mock_close.assert_called_once()
+
+    def test_callback_exception_propagates_unchanged(self) -> None:
+        class CustomError(Exception):
+            pass
+
+        exc = CustomError("boom")
+
+        def on_file(f: File) -> None:
+            raise exc
+
+        parser = FormParser(
+            "multipart/form-data", None, on_file, boundary="boundary", config={"REQUIRE_TERMINATOR": True}
+        )
+        with self.assertRaises(CustomError) as cm:
+            parser.write(self.COMPLETE_MESSAGE)
+        self.assertIs(cm.exception, exc)
+        self.assertIsNone(cm.exception.__context__)
+
+    def test_require_terminator_success(self) -> None:
+        fields: list[Field] = []
+        files: list[File] = []
+        on_end = Mock()
+        parser = FormParser(
+            "multipart/form-data",
+            fields.append,
+            files.append,
+            on_end=on_end,
+            boundary="boundary",
+            config={"REQUIRE_TERMINATOR": True},
+        )
+        parser.write(self.COMPLETE_MESSAGE)
+        parser.finalize()
+        parser.finalize()
+        self.assertEqual([f.field_name for f in fields], [b"field"])
+        self.assertEqual([f.file_name for f in files], [b"file.txt"])
+        on_end.assert_called_once()
+        files[0].close()
+
+    def test_lenient_by_default(self) -> None:
+        cut = self.COMPLETE_MESSAGE.index(b"file-content") + 4
+        fields: list[Field] = []
+        files: list[File] = []
+        parser = self.make_parser(fields, files)
+        parser.write(self.COMPLETE_MESSAGE[:cut])
+        # Without REQUIRE_TERMINATOR, finalize() accepts truncated input.
+        parser.finalize()
+        self.assertEqual([f.field_name for f in fields], [b"field"])
+        self.assertEqual(files, [])
+
+
 class TestHelperFunctions(unittest.TestCase):
     def test_create_form_parser(self) -> None:
         r = create_form_parser({"Content-Type": b"application/octet-stream"}, None, None)
@@ -1700,6 +2000,8 @@ def suite() -> unittest.TestSuite:
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestBase64Decoder))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestQuotedPrintableDecoder))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestFormParser))
+    suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestMultipartStrictFinalize))
+    suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestFormParserFailureHandling))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestHelperFunctions))
 
     return suite

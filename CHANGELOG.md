@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* Add optional strict end-of-message check to `MultipartParser` via `require_terminator=True`: `finalize()` now raises `MultipartParseError` (carrying the absolute input offset and the parse phase) unless a proper terminating boundary was seen. `FormParser` exposes this via the `REQUIRE_TERMINATOR` config key, and discards incomplete parts when parsing fails.
 * Speed up querystring callback dispatch [#316](https://github.com/Kludex/python-multipart/pull/316).
 
 ## 0.0.32 (2026-06-04)

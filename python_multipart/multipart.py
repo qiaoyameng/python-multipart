@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         MAX_BODY_SIZE: float
         MAX_HEADER_COUNT: int
         MAX_HEADER_SIZE: int
+        REQUIRE_TERMINATOR: bool
 
     CallbackName: TypeAlias = Literal[
         "start",
@@ -1031,6 +1032,10 @@ class MultipartParser(BaseParser):
         max_size: The maximum size of body to parse.  Defaults to infinity - i.e. unbounded.
         max_header_count: The maximum number of headers allowed per part.
         max_header_size: The maximum size of a single header line (excluding the trailing CRLF).
+        require_terminator: If True, :meth:`finalize` verifies that a proper terminating boundary
+            was seen, and raises a :class:`MultipartParseError` if the input ended prematurely
+            (e.g. because the upload connection was dropped).  Defaults to False, in which case
+            :meth:`finalize` accepts truncated input for backwards compatibility.
     """  # noqa: E501
 
     def __init__(
@@ -1041,6 +1046,7 @@ class MultipartParser(BaseParser):
         *,
         max_header_count: int = DEFAULT_MAX_HEADER_COUNT,
         max_header_size: int = DEFAULT_MAX_HEADER_SIZE,
+        require_terminator: bool = False,
     ) -> None:
         # Initialize parser state.
         super().__init__()
@@ -1059,6 +1065,9 @@ class MultipartParser(BaseParser):
 
         self.max_header_size = max_header_size
         self._current_header_size = 0
+
+        # Whether finalize() should require a proper terminating boundary.
+        self.require_terminator = require_terminator
 
         # Setup marks.  These are used to track the state of data received.
         self.marks: dict[str, int] = {}
@@ -1549,13 +1558,55 @@ class MultipartParser(BaseParser):
     def finalize(self) -> None:
         """Finalize this parser, which signals to that we are finished parsing.
 
-        Note: It does not currently, but in the future, it will verify that we
-        are in the final state of the parser (i.e. the end of the multipart
-        message is well-formed), and, if not, throw an error.
+        If the parser was created with ``require_terminator=True``, this
+        verifies that a proper terminating boundary was seen (i.e. the parser
+        reached the end of the multipart message).  If the input ended
+        prematurely - for example because the upload connection was dropped -
+        a :class:`MultipartParseError` is raised.  The exception's ``offset``
+        attribute is the absolute byte position within the whole input stream
+        (regardless of how the input was split across :meth:`write` calls),
+        and its ``phase`` attribute identifies what was being parsed when the
+        input ended: "headers", "part_data" or "boundary".
+
+        Epilogue data after the terminating boundary (RFC 2046 section 5.1.1)
+        is accepted.  Calling this method more than once has no additional
+        effect: it either returns or raises the same error each time.
+
+        Without ``require_terminator``, this is a no-op for backwards
+        compatibility.
         """
-        # TODO: verify that we're in the state MultipartState.END, otherwise throw an
-        # error or otherwise state that we're not finished parsing.
-        pass
+        if not self.require_terminator or self.state == MultipartState.END:
+            return
+
+        state = self.state
+        if state in (
+            MultipartState.HEADER_FIELD_START,
+            MultipartState.HEADER_FIELD,
+            MultipartState.HEADER_VALUE_START,
+            MultipartState.HEADER_VALUE,
+            MultipartState.HEADER_VALUE_ALMOST_DONE,
+            MultipartState.HEADERS_ALMOST_DONE,
+        ):
+            phase = "headers"
+            msg = "Unexpected end of multipart message while parsing part headers"
+        elif (
+            state in (MultipartState.PART_DATA_START, MultipartState.PART_DATA, MultipartState.PART_DATA_END)
+            and self.index == 0
+            and not (self.flags & (FLAG_PART_BOUNDARY | FLAG_LAST_BOUNDARY))
+        ):
+            phase = "part_data"
+            msg = "Unexpected end of multipart message in the middle of part data"
+        else:
+            # START/START_BOUNDARY/END_BOUNDARY, or part data that ends with a
+            # partial boundary match: the (terminating) boundary is incomplete.
+            phase = "boundary"
+            msg = "Unexpected end of multipart message: the terminating boundary is incomplete"
+
+        # The offset is the absolute position within the whole input stream,
+        # i.e. the total number of bytes consumed so far.
+        msg = "%s (offset %d)" % (msg, self._current_size)
+        self.logger.warning(msg)
+        raise MultipartParseError(msg, offset=self._current_size, phase=phase)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(boundary={self.boundary!r})"
@@ -1580,6 +1631,18 @@ class FormParser:
             manually.
         config: Configuration to use for this FormParser.  The default values are taken from the DEFAULT_CONFIG value,
             and then any keys present in this dictionary will overwrite the default values.
+
+    Note:
+        If parsing fails (a :class:`FormParserError` is raised from :meth:`write` or
+        :meth:`finalize`), a part that is still incomplete is finalized and closed internally,
+        and is never passed to ``on_field``/``on_file``.  Parts that were already completed and
+        handed to ``on_field``/``on_file`` belong to the caller: the FormParser does not close
+        or otherwise touch them, even if a later part fails.
+
+        For ``multipart/form-data``, setting the ``REQUIRE_TERMINATOR`` config key to True makes
+        :meth:`finalize` raise a :class:`MultipartParseError` if the input ended before the
+        terminating boundary (e.g. the upload connection was dropped), instead of silently
+        accepting the truncated message.
     """
 
     #: This is the default configuration for our form parser.
@@ -1595,6 +1658,8 @@ class FormParser:
         "UPLOAD_KEEP_EXTENSIONS": False,
         # Error on invalid Content-Transfer-Encoding?
         "UPLOAD_ERROR_ON_BAD_CTE": False,
+        # Require a proper terminating boundary when finalizing multipart messages?
+        "REQUIRE_TERMINATOR": False,
     }
 
     def __init__(
@@ -1619,6 +1684,10 @@ class FormParser:
         self.on_field = on_field
         self.on_file = on_file
         self.on_end = on_end
+
+        # Hook that deals with a part that is still incomplete when parsing
+        # fails.  Set by the multipart branch below; None for other parsers.
+        self._cleanup_incomplete_part: Callable[[], None] | None = None
 
         # Set configuration options.
         self.config: FormParserConfig = self.DEFAULT_CONFIG.copy()
@@ -1735,15 +1804,20 @@ class FormParser:
             def on_part_end() -> None:
                 nonlocal f_multi, is_file
                 assert f_multi is not None
-                f_multi.finalize()
+                # The part is complete: finalize it and hand it over to the
+                # caller.  From this point on the caller owns it - in
+                # particular, if parsing fails later on, completed parts are
+                # not closed by us (see discard_incomplete_part).
+                completed, f_multi = f_multi, None
+                completed.finalize()
                 if is_file:
                     if on_file:
-                        assert isinstance(f_multi, File)
-                        on_file(f_multi)
+                        assert isinstance(completed, File)
+                        on_file(completed)
                 else:
                     if on_field:
-                        assert isinstance(f_multi, Field)
-                        on_field(f_multi)
+                        assert isinstance(completed, Field)
+                        on_field(completed)
 
             def on_header_field(data: bytes, start: int, end: int) -> None:
                 header_name.append(data[start:end])
@@ -1813,6 +1887,29 @@ class FormParser:
                 if self.on_end is not None:
                     self.on_end()
 
+            def discard_incomplete_part() -> None:
+                # Called when parsing fails while a part is still incomplete.
+                # The incomplete part is finalized (so decoders flush and the
+                # File/Field is left in a consistent state) and then closed to
+                # release its resources; it is never passed to on_field/on_file.
+                nonlocal f_multi, writer
+                if writer is not None and writer is not f_multi:
+                    # A transfer-encoding decoder sits between the parser and
+                    # the File/Field.  Errors are expected here (the input was
+                    # truncated) and must not mask the original parse error.
+                    try:
+                        writer.finalize()
+                    except FormParserError:
+                        self.logger.exception("Error finalizing decoder of incomplete part")
+                part, f_multi, writer = f_multi, None, None
+                if part is not None:
+                    try:
+                        part.finalize()
+                    finally:
+                        part.close()
+
+            self._cleanup_incomplete_part = discard_incomplete_part
+
             # Instantiate a multipart parser.
             parser = MultipartParser(
                 boundary,
@@ -1829,6 +1926,7 @@ class FormParser:
                 max_size=self.config["MAX_BODY_SIZE"],
                 max_header_count=self.config["MAX_HEADER_COUNT"],
                 max_header_size=self.config["MAX_HEADER_SIZE"],
+                require_terminator=self.config["REQUIRE_TERMINATOR"],
             )
 
         else:
@@ -1848,14 +1946,38 @@ class FormParser:
             The number of bytes processed.
         """
         self.bytes_received += len(data)
-        # TODO: check the parser's return value for errors?
         assert self.parser is not None
-        return self.parser.write(data)
+        try:
+            return self.parser.write(data)
+        except FormParserError:
+            # Protocol error: deal with the part that is still incomplete.
+            # Exceptions raised by user callbacks are not FormParserErrors and
+            # propagate untouched, with their original exception chain.
+            self._discard_incomplete_part()
+            raise
 
     def finalize(self) -> None:
-        """Finalize the parser."""
+        """Finalize the parser.
+
+        If finalizing fails with a :class:`FormParserError` (e.g. a truncated
+        multipart message when the REQUIRE_TERMINATOR config key is set), the
+        part that is still incomplete is discarded before the error propagates.
+        """
         if self.parser is not None and hasattr(self.parser, "finalize"):
-            self.parser.finalize()
+            try:
+                self.parser.finalize()
+            except FormParserError:
+                self._discard_incomplete_part()
+                raise
+
+    def _discard_incomplete_part(self) -> None:
+        if self._cleanup_incomplete_part is None:
+            return
+        try:
+            self._cleanup_incomplete_part()
+        except Exception:
+            # Cleanup must never mask or replace the original parse error.
+            self.logger.exception("Error while discarding incomplete part")
 
     def close(self) -> None:
         """Close the parser."""

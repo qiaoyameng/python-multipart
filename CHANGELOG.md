@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* Add opt-in strict end check to `MultipartParser.finalize` via `strict_end_check`, raising a `MultipartParseError` with absolute input offset and parse phase on truncated input.
+* Close the incomplete part's file when a `FormParser` parse fails; completed files already handed to the caller are left untouched.
 * Speed up querystring callback dispatch [#316](https://github.com/Kludex/python-multipart/pull/316).
 
 ## 0.0.32 (2026-06-04)

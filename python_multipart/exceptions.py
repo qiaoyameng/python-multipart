@@ -15,7 +15,15 @@ class ParseError(FormParserError):
 class MultipartParseError(ParseError):
     """This is a specific error that is raised when the MultipartParser detects
     an error while parsing.
+
+    The "phase" attribute, when set, describes which stage of the multipart
+    message the parser was in when the error occurred (e.g. "headers", "body"
+    or "boundary").
     """
+
+    def __init__(self, message: str, *, offset: int = -1, phase: str | None = None) -> None:
+        super().__init__(message, offset=offset)
+        self.phase = phase
 
 
 class QuerystringParseError(ParseError):

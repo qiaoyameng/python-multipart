@@ -3,6 +3,7 @@
 ## Unreleased
 
 * Speed up querystring callback dispatch [#316](https://github.com/Kludex/python-multipart/pull/316).
+* Add `RelatedParser`, `RelatedPart` and `parse_related()` for streaming parsing of `multipart/related` messages (RFC 2387), selecting the root part via the `start`/`type` Content-Type parameters and spooling attachments through the existing `File` storage without buffering them in memory. Duplicate Content-IDs, a missing/mismatched root part, or a truncated message raise an error and close any parts not handed to the caller.
 
 ## 0.0.32 (2026-06-04)
 

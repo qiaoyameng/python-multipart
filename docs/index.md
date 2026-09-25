@@ -191,6 +191,61 @@ Part hash: 0b64696c0f7ddb9e3435341720988d5455b3b0f0724688f98ec8e6019af3d931
 ```
 
 
+## multipart/related
+
+Besides `multipart/form-data`, this library can parse
+[`multipart/related`](https://datatracker.ietf.org/doc/html/rfc2387) messages:
+a root document (often JSON) plus attachments that the root references by
+`Content-ID`. The root is *not* required to be the first part - it is located
+using the `start` parameter of the enclosing `Content-Type` header, falling
+back to the first part when `start` is absent. When a `type` parameter is
+present, the root part's media type must match it.
+
+Parts are never treated as named form controls: each one is returned as a
+[`RelatedPart`][python_multipart.RelatedPart] carrying its media type,
+Content-ID and raw data. The data is held in the same
+[`File`][python_multipart.multipart.File] storage as uploads (memory up to
+`MAX_MEMORY_FILE_SIZE`, then a temporary file on disk), so finding the root
+never requires buffering all attachments in memory.
+
+```python
+from io import BytesIO
+from python_multipart import parse_related
+
+headers = {
+    "Content-Type": (
+        b'multipart/related; boundary="B"; '
+        b'start="<root@example>"; type="application/json"'
+    )
+}
+body = (
+    b"--B\r\n"
+    b"Content-Type: image/png\r\nContent-ID: <logo@example>\r\n\r\n"
+    b"\x89PNG...\r\n"
+    b"--B\r\n"
+    b"Content-Type: application/json\r\nContent-ID: <root@example>\r\n\r\n"
+    b'{"logo": "cid:logo@example"}\r\n'
+    b"--B--\r\n"
+)
+
+root, parts = parse_related(headers, BytesIO(body))
+assert root.content_id == b"root@example"
+assert root.content_type == b"application/json"
+document = root.read()
+
+for part in parts:
+    part.close()  # caller owns the parts, including any temp files
+```
+
+Duplicate Content-IDs, a `start` parameter that names no part, a missing
+closing boundary, or a root whose media type disagrees with the declared
+`type` all raise an error. When that happens, every part that has not yet
+been handed back is closed, so backing temporary files are not leaked. For
+streaming use, drive [`RelatedParser`][python_multipart.RelatedParser]
+directly with `write()`/`finalize()` and receive parts through its
+`on_part`/`on_end` callbacks.
+
+
 ## Historical note
 
 This package used to be accessed via `import multipart`. This still works for

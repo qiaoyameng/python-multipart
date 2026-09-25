@@ -24,6 +24,15 @@ class QuerystringParseError(ParseError):
     """
 
 
+class RelatedParseError(ParseError):
+    """This is a specific error that is raised when a multipart/related
+    message cannot be assembled into a root document and its attachments - for
+    example, when a Content-ID is duplicated, the root part referenced by the
+    ``start`` parameter cannot be found, or the root part's media type does not
+    match the declared ``type`` parameter.
+    """
+
+
 class DecodeError(ParseError):
     """This exception is raised when there is a decoding error - for example
     with the Base64Decoder or QuotedPrintableDecoder.

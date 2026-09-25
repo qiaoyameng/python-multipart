@@ -20,8 +20,11 @@ from .multipart import (
     MultipartParser,
     OctetStreamParser,
     QuerystringParser,
+    RelatedParser,
+    RelatedPart,
     create_form_parser,
     parse_form,
+    parse_related,
 )
 
 __all__ = (
@@ -30,6 +33,9 @@ __all__ = (
     "MultipartParser",
     "OctetStreamParser",
     "QuerystringParser",
+    "RelatedParser",
+    "RelatedPart",
     "create_form_parser",
     "parse_form",
+    "parse_related",
 )

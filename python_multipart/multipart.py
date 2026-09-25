@@ -1957,3 +1957,401 @@ def parse_form(
 
     # Tell our parser that we're done writing data.
     parser.finalize()
+
+
+class RelatedPart:
+    """This class represents a single part of a ``multipart/related`` message
+    (RFC 2387).
+
+    Unlike form fields, related parts are not identified by a form field name.
+    Each part keeps its own media type and (optional) Content-ID, and the raw
+    part data is stored in a :class:`File` object, which transparently spills
+    to a temporary file on disk once it grows beyond the configured in-memory
+    limit - so parts are never required to fit in memory.
+
+    Attributes:
+        content_id: The value of the part's Content-ID header (with surrounding
+            whitespace stripped), or None if the part has no Content-ID header.
+        content_type: The value of the part's Content-Type header, or None if
+            the part has no Content-Type header.
+        headers: All headers of the part, as a dictionary of lower-cased header
+            names to header values.
+        file: The :class:`File` object holding the raw data of the part.
+    """
+
+    def __init__(
+        self,
+        content_id: bytes | None,
+        content_type: str | None,
+        headers: dict[bytes, bytes],
+        file: File,
+    ) -> None:
+        self.content_id = content_id
+        self.content_type = content_type
+        self.headers = headers
+        self.file = file
+
+    @property
+    def media_type(self) -> str | None:
+        """The part's media type - the Content-Type without any parameters,
+        lower-cased - or None if the part has no Content-Type header.
+        """
+        if self.content_type is None:
+            return None
+        return self.content_type.split(";", 1)[0].strip().lower()
+
+    @property
+    def size(self) -> int:
+        """The size of the part's raw data, in bytes."""
+        return self.file.size
+
+    @property
+    def data(self) -> bytes:
+        """The raw data of the part.  Note that this reads the entire part
+        into memory; for large parts, read from :attr:`file` directly instead.
+        """
+        self.file.file_object.seek(0)
+        return self.file.file_object.read()
+
+    def close(self) -> None:
+        """Close the underlying :class:`File` object, releasing any temporary
+        file resources held by this part.
+        """
+        self.file.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(content_id={self.content_id!r}, "
+            f"content_type={self.content_type!r}, size={self.file.size})"
+        )
+
+
+class RelatedParser(BaseParser):
+    """This class is a streaming parser for ``multipart/related`` messages
+    (RFC 2387), such as a JSON root document plus a number of attachments that
+    reference each other via Content-ID headers.
+
+    The root part of the message is selected by the ``start`` parameter of the
+    Content-Type header; the root part is not required to be the first part of
+    the message.  If no ``start`` parameter is given, the first part is the
+    root, per RFC 2387 §3.4.  If a ``root_content_type`` (the Content-Type
+    ``type`` parameter) is declared, the root part's media type must match it.
+
+    Each part is stored as a :class:`RelatedPart` whose data lives in a
+    :class:`File`, so attachments spill to disk instead of being held in
+    memory while waiting for the root part.  Parsed parts are available in
+    :attr:`parts` once parsing finishes; ownership of the parts passes to the
+    caller only after :meth:`finalize` completes successfully.  If parsing
+    fails at any point, all parts that were not handed off to the caller
+    (including any temporary files on disk) are closed automatically.
+
+    Args:
+        boundary: The multipart boundary, as given in the Content-Type header.
+        start: The value of the Content-Type ``start`` parameter - the
+            Content-ID of the root part.  If None, the first part is the root.
+        root_content_type: The value of the Content-Type ``type`` parameter -
+            the declared media type of the root part.  If given, the root
+            part's media type must match, otherwise parsing fails.
+        config: Configuration to use for this parser.  The default values are
+            taken from the DEFAULT_CONFIG value, and then any keys present in
+            this dictionary will overwrite the default values.
+    """
+
+    #: This is the default configuration for our related parser.
+    #: Note: all file sizes should be in bytes.
+    DEFAULT_CONFIG: FormParserConfig = {
+        "MAX_BODY_SIZE": float("inf"),
+        "MAX_HEADER_COUNT": DEFAULT_MAX_HEADER_COUNT,
+        "MAX_HEADER_SIZE": DEFAULT_MAX_HEADER_SIZE,
+        "MAX_MEMORY_FILE_SIZE": 1 * 1024 * 1024,
+        "UPLOAD_DIR": None,
+        "UPLOAD_DELETE_TMP": True,
+        "UPLOAD_KEEP_FILENAME": False,
+        "UPLOAD_KEEP_EXTENSIONS": False,
+    }
+
+    def __init__(
+        self,
+        boundary: bytes | str,
+        *,
+        start: bytes | str | None = None,
+        root_content_type: bytes | str | None = None,
+        config: dict[Any, Any] = {},
+    ) -> None:
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+
+        # Save the root part selectors.
+        if isinstance(start, str):
+            start = start.encode("latin-1")
+        if start is not None:
+            start = start.strip()
+        self.start = start
+
+        if isinstance(root_content_type, bytes):
+            root_content_type = root_content_type.decode("latin-1")
+        self.root_content_type = root_content_type.strip().lower() if root_content_type else None
+
+        # Set configuration options.
+        self.config: FormParserConfig = self.DEFAULT_CONFIG.copy()
+        self.config.update(config)  # type: ignore[typeddict-item]
+
+        self.bytes_received = 0
+
+        # The parts parsed so far, in message order.  Ownership of these parts
+        # (and their temporary files) passes to the caller only once finalize()
+        # has completed successfully.
+        self.parts: list[RelatedPart] = []
+
+        # The root part, determined as parts are parsed.  Only valid after
+        # finalize() has completed successfully.
+        self.root: RelatedPart | None = None
+
+        self._content_ids: set[bytes] = set()
+        self._current_file: File | None = None
+        self._failed = False
+        self._finalized = False
+
+        header_name: list[bytes] = []
+        header_value: list[bytes] = []
+        headers: dict[bytes, bytes] = {}
+
+        part_headers: dict[bytes, bytes] = {}
+        part_content_type: str | None = None
+
+        def on_part_begin() -> None:
+            # Reset headers in case this isn't the first part.
+            nonlocal headers
+            headers = {}
+
+        def on_header_field(data: bytes, start: int, end: int) -> None:
+            header_name.append(data[start:end])
+
+        def on_header_value(data: bytes, start: int, end: int) -> None:
+            header_value.append(data[start:end])
+
+        def on_header_end() -> None:
+            headers[b"".join(header_name).lower()] = b"".join(header_value)
+            del header_name[:]
+            del header_value[:]
+
+        def on_headers_finished() -> None:
+            nonlocal part_headers, part_content_type
+            part_headers = dict(headers)
+            content_type = headers.get(b"content-type")
+            part_content_type = content_type.decode("latin-1") if content_type is not None else None
+            # Store the raw part data in a File, which spills to disk once the
+            # part grows beyond the configured in-memory limit.
+            self._current_file = File(None, None, config=self.config, content_type=part_content_type)
+
+        def on_part_data(data: bytes, start: int, end: int) -> None:
+            assert self._current_file is not None
+            self._current_file.write(data[start:end])
+
+        def on_part_end() -> None:
+            nonlocal part_headers
+            assert self._current_file is not None
+            self._current_file.finalize()
+
+            content_id = part_headers.get(b"content-id")
+            if content_id is not None:
+                content_id = content_id.strip()
+                if content_id in self._content_ids:
+                    raise MultipartParseError(f"Duplicate Content-ID: {content_id!r}")
+                self._content_ids.add(content_id)
+
+            part = RelatedPart(content_id, part_content_type, part_headers, self._current_file)
+            self._current_file = None
+            part_headers = {}
+            self.parts.append(part)
+
+            # The root part is either the part named by the Content-Type
+            # "start" parameter, or - per RFC 2387 §3.4 - the first part of
+            # the message when no "start" parameter was given.
+            if self.root is None and (self.start is None or content_id == self.start):
+                self.root = part
+
+        # Instantiate a multipart parser.
+        self.parser: MultipartParser | None = MultipartParser(
+            boundary,
+            callbacks={
+                "on_part_begin": on_part_begin,
+                "on_part_data": on_part_data,
+                "on_part_end": on_part_end,
+                "on_header_field": on_header_field,
+                "on_header_value": on_header_value,
+                "on_header_end": on_header_end,
+                "on_headers_finished": on_headers_finished,
+            },
+            max_size=self.config["MAX_BODY_SIZE"],
+            max_header_count=self.config["MAX_HEADER_COUNT"],
+            max_header_size=self.config["MAX_HEADER_SIZE"],
+        )
+
+    @property
+    def attachments(self) -> list[RelatedPart]:
+        """All parsed parts except the root part, in message order."""
+        return [part for part in self.parts if part is not self.root]
+
+    def write(self, data: bytes) -> int:
+        """Write some data.  The parser will forward this to the underlying
+        multipart parser.
+
+        Args:
+            data: The data to write.
+
+        Returns:
+            The number of bytes processed.
+        """
+        if self._failed:
+            raise FormParserError("Cannot write to a failed parser")
+        self.bytes_received += len(data)
+        try:
+            assert self.parser is not None
+            return self.parser.write(data)
+        except Exception:
+            self._abort()
+            raise
+
+    def finalize(self) -> None:
+        """Finalize the parser.  This verifies that the message contained a
+        root part matching the ``start`` parameter (if any) and that the root
+        part's media type matches the declared ``type`` parameter (if any).
+        """
+        if self._failed:
+            raise FormParserError("Cannot finalize a failed parser")
+        try:
+            if self.parser is not None:
+                self.parser.finalize()
+            self._resolve_root()
+        except Exception:
+            self._abort()
+            raise
+        self._finalized = True
+
+    def _resolve_root(self) -> None:
+        if not self.parts:
+            raise MultipartParseError("multipart/related message contains no parts")
+        if self.start is not None and self.root is None:
+            raise MultipartParseError(f"Root part not found: no part with Content-ID {self.start!r}")
+        assert self.root is not None
+        if self.root_content_type is not None:
+            # Per RFC 2045 §5.2, a part without a Content-Type header defaults
+            # to "text/plain".
+            actual = self.root.media_type or "text/plain"
+            if actual != self.root_content_type:
+                raise MultipartParseError(
+                    f"Root part Content-Type {actual!r} does not match declared type {self.root_content_type!r}"
+                )
+
+    def _abort(self) -> None:
+        """Close all parts that have not been handed off to the caller,
+        releasing any temporary files held by them.
+        """
+        self._failed = True
+        if self._current_file is not None:
+            self._current_file.close()
+            self._current_file = None
+        for part in self.parts:
+            part.close()
+
+    def close(self) -> None:
+        """Close the parser and all parsed parts, releasing any temporary
+        files held by them.
+        """
+        if self._current_file is not None:
+            self._current_file.close()
+            self._current_file = None
+        for part in self.parts:
+            part.close()
+
+    def __enter__(self) -> RelatedParser:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(parts={len(self.parts)}, root={self.root!r})"
+
+
+def parse_related(
+    headers: dict[str, bytes],
+    input_stream: SupportsRead,
+    chunk_size: int = 1048576,
+    config: dict[Any, Any] = {},
+) -> RelatedParser:
+    """This function parses a ``multipart/related`` request body (RFC 2387)
+    from a file-like object and returns the finalized :class:`RelatedParser`.
+    The root part is selected by the Content-Type ``start`` parameter (or
+    defaults to the first part), and is validated against the Content-Type
+    ``type`` parameter, if one is declared.
+
+    Args:
+        headers: A dictionary-like object of HTTP headers.  The Content-Type
+            header must be present and must be ``multipart/related``.
+        input_stream: A file-like object that represents the request body. The read() method must return bytestrings.
+        chunk_size: The maximum size to read from the input stream and write to the parser at one time.
+            Defaults to 1 MiB.
+        config: Configuration variables to pass to the RelatedParser.
+
+    Returns:
+        The finalized RelatedParser, whose ``root`` and ``parts`` attributes
+        hold the parsed message.  The caller owns the parsed parts and should
+        call ``close()`` on the parser when done with them.
+    """  # noqa: E501
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be a positive number, not {chunk_size!r}")
+
+    content_type: str | bytes | None = headers.get("Content-Type")
+    if content_type is None:
+        logging.getLogger(__name__).warning("No Content-Type header given")
+        raise ValueError("No Content-Type header given!")
+
+    ctype, params = parse_options_header(content_type)
+    if ctype != b"multipart/related":
+        raise FormParserError(f"Expected multipart/related Content-Type, got {ctype.decode('latin-1')!r}")
+
+    boundary = params.get(b"boundary")
+    if boundary is None:
+        logging.getLogger(__name__).error("No boundary given")
+        raise FormParserError("No boundary given")
+
+    # Create our related parser.
+    parser = RelatedParser(
+        boundary,
+        start=params.get(b"start"),
+        root_content_type=params.get(b"type"),
+        config=config,
+    )
+
+    # Read chunks and write to the parser, but never read more than the given
+    # Content-Length, if any.
+    content_length: int | float | bytes | None = headers.get("Content-Length")
+    if content_length is not None:
+        content_length = int(content_length)
+        if content_length < 0:
+            raise ValueError("Content-Length must be non-negative")
+    else:
+        content_length = float("inf")
+    bytes_read = 0
+
+    while True:
+        # Read only up to the Content-Length given.
+        max_readable = int(min(content_length - bytes_read, chunk_size))
+        buff = input_stream.read(max_readable)
+
+        # Write to the parser and update our length.
+        parser.write(buff)
+        bytes_read += len(buff)
+
+        # If we get a buffer that's smaller than the size requested, or if we
+        # have read up to our content length, we're done.
+        if len(buff) != max_readable or bytes_read == content_length:
+            break
+
+    # Tell our parser that we're done writing data.
+    parser.finalize()
+
+    # Return the parser, handing ownership of the parsed parts to the caller.
+    return parser

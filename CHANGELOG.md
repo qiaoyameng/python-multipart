@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Add opt-in `NESTED_MULTIPART_MIXED` compatibility mode to `FormParser` that streams the files of legacy
+  `multipart/mixed` sub-parts one at a time (keeping the outer field name), bounded by
+  `MAX_NESTED_MULTIPART_DEPTH`.
 * Speed up querystring callback dispatch [#316](https://github.com/Kludex/python-multipart/pull/316).
 
 ## 0.0.32 (2026-06-04)

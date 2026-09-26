@@ -55,6 +55,8 @@ if TYPE_CHECKING:
         MAX_BODY_SIZE: float
         MAX_HEADER_COUNT: int
         MAX_HEADER_SIZE: int
+        NESTED_MULTIPART_MIXED: bool
+        MAX_NESTED_MULTIPART_DEPTH: int
 
     CallbackName: TypeAlias = Literal[
         "start",
@@ -161,6 +163,15 @@ MAX_BOUNDARY_LENGTH = 256
 [RFC 2046 §5.1.1](https://datatracker.ietf.org/doc/html/rfc2046#section-5.1.1)
 recommends boundaries be at most 70 bytes. 256 bytes is generous headroom over
 every HTTP client.
+"""
+
+DEFAULT_MAX_NESTED_MULTIPART_DEPTH = 4
+"""Default maximum nesting depth for multipart/mixed sub-parts.
+
+Only relevant when the ``NESTED_MULTIPART_MIXED`` compatibility mode is
+enabled on :class:`FormParser`. One level covers the legacy case of a field
+whose attachments are wrapped in a single multipart/mixed sub-part; anything
+deeper is almost certainly malformed or abusive.
 """
 
 
@@ -1580,6 +1591,14 @@ class FormParser:
             manually.
         config: Configuration to use for this FormParser.  The default values are taken from the DEFAULT_CONFIG value,
             and then any keys present in this dictionary will overwrite the default values.
+
+    The ``NESTED_MULTIPART_MIXED`` config option enables a compatibility mode
+    for legacy systems that wrap the multiple attachments of a single field in
+    a ``multipart/mixed`` sub-part.  When enabled, such sub-parts are parsed
+    with a streaming nested parser: the inner files are produced one at a time
+    (without buffering the whole parent part) and keep the outer field name.
+    ``MAX_NESTED_MULTIPART_DEPTH`` bounds how deep such nesting may go.  The
+    default ``multipart/form-data`` behavior is unchanged.
     """
 
     #: This is the default configuration for our form parser.
@@ -1595,6 +1614,11 @@ class FormParser:
         "UPLOAD_KEEP_EXTENSIONS": False,
         # Error on invalid Content-Transfer-Encoding?
         "UPLOAD_ERROR_ON_BAD_CTE": False,
+        # Legacy compatibility mode: parse "multipart/mixed" sub-parts
+        # (multiple attachments for a single field) with a streaming nested
+        # parser instead of treating them as opaque field values.
+        "NESTED_MULTIPART_MIXED": False,
+        "MAX_NESTED_MULTIPART_DEPTH": DEFAULT_MAX_NESTED_MULTIPART_DEPTH,
     }
 
     def __init__(
@@ -1713,123 +1737,205 @@ class FormParser:
                 self.logger.error("No boundary given")
                 raise FormParserError("No boundary given")
 
-            header_name: list[bytes] = []
-            header_value: list[bytes] = []
-            headers: dict[bytes, bytes] = {}
+            # Legacy compatibility mode: parse "multipart/mixed" sub-parts with
+            # a streaming nested parser (see the class docstring).
+            allow_nested_mixed = bool(self.config["NESTED_MULTIPART_MIXED"])
+            max_nested_depth = self.config["MAX_NESTED_MULTIPART_DEPTH"]
 
-            f_multi: File | Field | None = None
-            writer: File | Field | Base64Decoder | QuotedPrintableDecoder | None = None
-            is_file = False
+            def make_multipart_parser(
+                boundary: bytes | str, depth: int, inherited_field_name: bytes | None = None
+            ) -> tuple[MultipartParser, Callable[[], None]]:
+                """Create a MultipartParser wired up to Field/File creation.
 
-            def on_part_begin() -> None:
-                # Reset headers in case this isn't the first part.
-                nonlocal headers
-                headers = {}
+                Returns the parser and an "abort" function that closes any file
+                left open at this level or below, used to clean up when
+                malformed nested content is detected.
+                """
+                header_name: list[bytes] = []
+                header_value: list[bytes] = []
+                headers: dict[bytes, bytes] = {}
 
-            def on_part_data(data: bytes, start: int, end: int) -> None:
-                nonlocal writer
-                assert writer is not None
-                writer.write(data[start:end])
-                # TODO: check for error here.
-
-            def on_part_end() -> None:
-                nonlocal f_multi, is_file
-                assert f_multi is not None
-                f_multi.finalize()
-                if is_file:
-                    if on_file:
-                        assert isinstance(f_multi, File)
-                        on_file(f_multi)
-                else:
-                    if on_field:
-                        assert isinstance(f_multi, Field)
-                        on_field(f_multi)
-
-            def on_header_field(data: bytes, start: int, end: int) -> None:
-                header_name.append(data[start:end])
-
-            def on_header_value(data: bytes, start: int, end: int) -> None:
-                header_value.append(data[start:end])
-
-            def on_header_end() -> None:
-                headers[b"".join(header_name).lower()] = b"".join(header_value)
-                del header_name[:]
-                del header_value[:]
-
-            def on_headers_finished() -> None:
-                nonlocal is_file, f_multi, writer
-                # Reset the 'is file' flag.
+                f_multi: File | Field | None = None
+                writer: File | Field | Base64Decoder | QuotedPrintableDecoder | None = None
                 is_file = False
 
-                # Parse the content-disposition header.
-                content_disp = headers.get(b"content-disposition")
-                disp, options = parse_options_header(content_disp)
+                # State of the nested parser handling a multipart/mixed
+                # sub-part, if the current part is one.
+                nested_parser: MultipartParser | None = None
+                nested_abort: Callable[[], None] | None = None
 
-                # Get the field and filename.
-                field_name = options.get(b"name")
-                file_name = options.get(b"filename")
-                # RFC 7578 §4.2: each part MUST have a Content-Disposition header with a "name" parameter.
-                if field_name is None:
-                    raise FormParserError(f'Field name not found in Content-Disposition: "{content_disp!r}"')
+                def abort() -> None:
+                    # Close anything left open at deeper levels first.
+                    nonlocal f_multi, writer
+                    if nested_abort is not None:
+                        nested_abort()
+                    if isinstance(f_multi, File):
+                        f_multi.close()
+                    f_multi = None
+                    writer = None
 
-                # Create the proper class.
-                content_type_b = headers.get(b"content-type")
-                content_type = content_type_b.decode("latin-1") if content_type_b is not None else None
-                if file_name is None:
-                    f_multi = Field(field_name, content_type=content_type)
-                else:
-                    f_multi = File(file_name, field_name, config=self.config, content_type=content_type)
-                    is_file = True
+                def on_part_begin() -> None:
+                    # Reset headers in case this isn't the first part.
+                    nonlocal headers
+                    headers = {}
 
-                # Parse the given Content-Transfer-Encoding to determine what
-                # we need to do with the incoming data.
-                # TODO: check that we properly handle 8bit / 7bit encoding.
-                # RFC 2045 section 6.1: Content-Transfer-Encoding values are case-insensitive.
-                # https://www.rfc-editor.org/rfc/rfc2045#section-6.1
-                transfer_encoding = headers.get(b"content-transfer-encoding", b"7bit").lower()
+                def on_part_data(data: bytes, start: int, end: int) -> None:
+                    if nested_parser is not None:
+                        # Stream the raw bytes of the parent part straight into
+                        # the nested parser, so the inner files are produced
+                        # one at a time without buffering the whole parent part.
+                        try:
+                            nested_parser.write(data[start:end])
+                        except Exception:
+                            # Malformed nested content: close any file the
+                            # nested parser left open before propagating.
+                            assert nested_abort is not None
+                            nested_abort()
+                            raise
+                        return
+                    assert writer is not None
+                    writer.write(data[start:end])
+                    # TODO: check for error here.
 
-                if transfer_encoding in (b"binary", b"8bit", b"7bit"):
-                    writer = f_multi
-
-                elif transfer_encoding == b"base64":
-                    writer = Base64Decoder(f_multi)
-
-                elif transfer_encoding == b"quoted-printable":
-                    writer = QuotedPrintableDecoder(f_multi)
-
-                else:
-                    self.logger.warning("Unknown Content-Transfer-Encoding: %r", transfer_encoding)
-                    if self.config["UPLOAD_ERROR_ON_BAD_CTE"]:
-                        raise FormParserError(f'Unknown Content-Transfer-Encoding "{transfer_encoding!r}"')
+                def on_part_end() -> None:
+                    nonlocal f_multi, is_file, nested_parser, nested_abort
+                    if nested_parser is not None:
+                        # The parent part is over; the nested parser must have
+                        # consumed its own closing boundary by now, otherwise
+                        # the nested message is malformed (e.g. the inner end
+                        # marker is missing).
+                        child, nested_parser = nested_parser, None
+                        child_abort, nested_abort = nested_abort, None
+                        if child.state is not MultipartState.END:
+                            assert child_abort is not None
+                            child_abort()
+                            raise MultipartParseError("Nested multipart/mixed part is missing its closing boundary")
+                        return
+                    assert f_multi is not None
+                    f_multi.finalize()
+                    if is_file:
+                        if on_file:
+                            assert isinstance(f_multi, File)
+                            on_file(f_multi)
                     else:
-                        # If we aren't erroring, then we just treat this as an
-                        # unencoded Content-Transfer-Encoding.
+                        if on_field:
+                            assert isinstance(f_multi, Field)
+                            on_field(f_multi)
+
+                def on_header_field(data: bytes, start: int, end: int) -> None:
+                    header_name.append(data[start:end])
+
+                def on_header_value(data: bytes, start: int, end: int) -> None:
+                    header_value.append(data[start:end])
+
+                def on_header_end() -> None:
+                    headers[b"".join(header_name).lower()] = b"".join(header_value)
+                    del header_name[:]
+                    del header_value[:]
+
+                def on_headers_finished() -> None:
+                    nonlocal is_file, f_multi, writer, nested_parser, nested_abort
+                    # Reset the 'is file' flag and the previous part's writer.
+                    is_file = False
+                    writer = None
+
+                    # Parse the content-disposition header.
+                    content_disp = headers.get(b"content-disposition")
+                    disp, options = parse_options_header(content_disp)
+
+                    # Get the field and filename.
+                    field_name = options.get(b"name")
+                    file_name = options.get(b"filename")
+                    if inherited_field_name is not None:
+                        # Inside a multipart/mixed sub-part, every inner file
+                        # keeps the outer field name.
+                        field_name = inherited_field_name
+                    # RFC 7578 §4.2: each part MUST have a Content-Disposition header with a "name" parameter.
+                    elif field_name is None:
+                        raise FormParserError(f'Field name not found in Content-Disposition: "{content_disp!r}"')
+
+                    # Create the proper class.
+                    content_type_b = headers.get(b"content-type")
+                    content_type = content_type_b.decode("latin-1") if content_type_b is not None else None
+
+                    if allow_nested_mixed and content_type_b is not None:
+                        ctype, ctype_options = parse_options_header(content_type_b)
+                        if ctype == b"multipart/mixed":
+                            inner_boundary = ctype_options.get(b"boundary")
+                            if inner_boundary is None:
+                                raise FormParserError(
+                                    f'Nested multipart/mixed part has no boundary: "{content_type_b!r}"'
+                                )
+                            if depth + 1 > max_nested_depth:
+                                raise FormParserError(f"Maximum nested multipart depth ({max_nested_depth}) exceeded")
+                            transfer_encoding = headers.get(b"content-transfer-encoding", b"7bit").lower()
+                            if transfer_encoding not in (b"binary", b"8bit", b"7bit"):
+                                raise FormParserError(
+                                    f'Unsupported Content-Transfer-Encoding "{transfer_encoding!r}"'
+                                    " on nested multipart/mixed part"
+                                )
+                            # Parse the sub-part with a streaming nested parser
+                            # instead of buffering it as an opaque value.
+                            nested_parser, nested_abort = make_multipart_parser(inner_boundary, depth + 1, field_name)
+                            return
+
+                    if file_name is None:
+                        f_multi = Field(field_name, content_type=content_type)
+                    else:
+                        f_multi = File(file_name, field_name, config=self.config, content_type=content_type)
+                        is_file = True
+
+                    # Parse the given Content-Transfer-Encoding to determine what
+                    # we need to do with the incoming data.
+                    # TODO: check that we properly handle 8bit / 7bit encoding.
+                    # RFC 2045 section 6.1: Content-Transfer-Encoding values are case-insensitive.
+                    # https://www.rfc-editor.org/rfc/rfc2045#section-6.1
+                    transfer_encoding = headers.get(b"content-transfer-encoding", b"7bit").lower()
+
+                    if transfer_encoding in (b"binary", b"8bit", b"7bit"):
                         writer = f_multi
 
-            def _on_end() -> None:
-                nonlocal writer
-                if writer is not None:
-                    writer.finalize()
-                if self.on_end is not None:
-                    self.on_end()
+                    elif transfer_encoding == b"base64":
+                        writer = Base64Decoder(f_multi)
 
-            # Instantiate a multipart parser.
-            parser = MultipartParser(
-                boundary,
-                callbacks={
-                    "on_part_begin": on_part_begin,
-                    "on_part_data": on_part_data,
-                    "on_part_end": on_part_end,
-                    "on_header_field": on_header_field,
-                    "on_header_value": on_header_value,
-                    "on_header_end": on_header_end,
-                    "on_headers_finished": on_headers_finished,
-                    "on_end": _on_end,
-                },
-                max_size=self.config["MAX_BODY_SIZE"],
-                max_header_count=self.config["MAX_HEADER_COUNT"],
-                max_header_size=self.config["MAX_HEADER_SIZE"],
-            )
+                    elif transfer_encoding == b"quoted-printable":
+                        writer = QuotedPrintableDecoder(f_multi)
+
+                    else:
+                        self.logger.warning("Unknown Content-Transfer-Encoding: %r", transfer_encoding)
+                        if self.config["UPLOAD_ERROR_ON_BAD_CTE"]:
+                            raise FormParserError(f'Unknown Content-Transfer-Encoding "{transfer_encoding!r}"')
+                        else:
+                            # If we aren't erroring, then we just treat this as an
+                            # unencoded Content-Transfer-Encoding.
+                            writer = f_multi
+
+                def _on_end() -> None:
+                    if writer is not None:
+                        writer.finalize()
+                    if depth == 0 and self.on_end is not None:
+                        self.on_end()
+
+                # Instantiate a multipart parser.
+                parser = MultipartParser(
+                    boundary,
+                    callbacks={
+                        "on_part_begin": on_part_begin,
+                        "on_part_data": on_part_data,
+                        "on_part_end": on_part_end,
+                        "on_header_field": on_header_field,
+                        "on_header_value": on_header_value,
+                        "on_header_end": on_header_end,
+                        "on_headers_finished": on_headers_finished,
+                        "on_end": _on_end,
+                    },
+                    max_size=self.config["MAX_BODY_SIZE"],
+                    max_header_count=self.config["MAX_HEADER_COUNT"],
+                    max_header_size=self.config["MAX_HEADER_SIZE"],
+                )
+                return parser, abort
+
+            parser, _ = make_multipart_parser(boundary, 0)
 
         else:
             self.logger.warning("Unknown Content-Type: %r", content_type)

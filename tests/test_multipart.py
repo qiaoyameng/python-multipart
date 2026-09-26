@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import yaml
@@ -1626,6 +1626,294 @@ class TestFormParser(unittest.TestCase):
         # Assert that we called our 'header_begin' callback three times; once
         # for each header in the multipart message.
         self.assertEqual(calls, 3)
+
+
+class TestFormParserNestedMixed(unittest.TestCase):
+    """Tests for the opt-in multipart/mixed legacy compatibility mode."""
+
+    def make(self, boundary: bytes = b"outer", config: dict[str, Any] = {}) -> None:
+        self.ended = False
+        self.files: list[File] = []
+        self.fields: list[Field] = []
+
+        def on_end() -> None:
+            self.ended = True
+
+        full_config: dict[str, Any] = {"NESTED_MULTIPART_MIXED": True}
+        full_config.update(config)
+        self.f = FormParser(
+            "multipart/form-data", self.fields.append, self.files.append, on_end, boundary=boundary, config=full_config
+        )
+
+    def feed(self, data: bytes, chunk_size: int | None = None) -> None:
+        if chunk_size is None:
+            self.f.write(data)
+        else:
+            for i in range(0, len(data), chunk_size):
+                self.f.write(data[i : i + chunk_size])
+        self.f.finalize()
+
+    @staticmethod
+    def nested_message(inner: bytes = b"inner", outer: bytes = b"outer") -> bytes:
+        return (
+            b"--" + outer + b"\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=" + inner + b"\r\n"
+            b"\r\n"
+            b"--" + inner + b"\r\n"
+            b'Content-Disposition: attachment; filename="a.txt"\r\n'
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"hello a\r\n"
+            b"--" + inner + b"\r\n"
+            b'Content-Disposition: attachment; filename="b.txt"\r\n'
+            b"\r\n"
+            b"hello b\r\n"
+            b"--" + inner + b"--\r\n"
+            b"--" + outer + b"\r\n"
+            b'Content-Disposition: form-data; name="comment"\r\n'
+            b"\r\n"
+            b"after\r\n"
+            b"--" + outer + b"\r\n"
+            b'Content-Disposition: form-data; name="upload"; filename="later.bin"\r\n'
+            b"\r\n"
+            b"later-data\r\n"
+            b"--" + outer + b"--\r\n"
+        )
+
+    def file_data(self, f: File) -> bytes:
+        o = f.file_object
+        o.seek(0)
+        return o.read()
+
+    def assert_nested_message(self) -> None:
+        # The inner files are produced one at a time and keep the outer field name.
+        self.assertEqual([f.field_name for f in self.files], [b"files", b"files", b"upload"])
+        self.assertEqual([f.file_name for f in self.files], [b"a.txt", b"b.txt", b"later.bin"])
+        self.assertEqual([self.file_data(f) for f in self.files], [b"hello a", b"hello b", b"later-data"])
+        # The parser keeps going after the nested section ends.
+        self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"comment", b"after")])
+        self.assertTrue(self.ended)
+
+    def test_nested_mixed(self) -> None:
+        self.make()
+        self.feed(self.nested_message())
+        self.assert_nested_message()
+
+    def test_nested_mixed_one_byte_at_a_time(self) -> None:
+        self.make()
+        self.feed(self.nested_message(), chunk_size=1)
+        self.assert_nested_message()
+
+    def test_nested_mixed_common_boundary_prefix(self) -> None:
+        # The inner boundary starts with the outer boundary; neither parser
+        # may mistake the other's delimiter for its own.
+        self.make(boundary=b"boundary")
+        msg = self.nested_message(inner=b"boundary-inner", outer=b"boundary")
+        self.feed(msg, chunk_size=1)
+        self.assert_nested_message()
+
+    def test_nested_mixed_common_boundary_prefix_reversed(self) -> None:
+        # The outer boundary starts with the inner boundary.
+        self.make(boundary=b"boundary-outer")
+        msg = self.nested_message(inner=b"boundary", outer=b"boundary-outer")
+        self.feed(msg, chunk_size=1)
+        self.assert_nested_message()
+
+    def test_nested_mixed_empty_subpart(self) -> None:
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: attachment; filename="empty.txt"\r\n'
+            b"\r\n"
+            b"\r\n"
+            b"--inner--\r\n"
+            b"--outer--\r\n"
+        )
+        self.feed(msg, chunk_size=1)
+        self.assertEqual(len(self.files), 1)
+        self.assertEqual(self.files[0].field_name, b"files")
+        self.assertEqual(self.files[0].file_name, b"empty.txt")
+        self.assertEqual(self.file_data(self.files[0]), b"")
+        self.assertTrue(self.ended)
+
+    def test_nested_mixed_empty_container(self) -> None:
+        # A multipart/mixed sub-part with no inner parts at all yields nothing.
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner--\r\n"
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="comment"\r\n'
+            b"\r\n"
+            b"after\r\n"
+            b"--outer--\r\n"
+        )
+        self.feed(msg, chunk_size=1)
+        self.assertEqual(self.files, [])
+        self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"comment", b"after")])
+        self.assertTrue(self.ended)
+
+    def test_nested_mixed_missing_inner_end_marker(self) -> None:
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: attachment; filename="a.txt"\r\n'
+            b"\r\n"
+            b"hello a\r\n"
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="comment"\r\n'
+            b"\r\n"
+            b"after\r\n"
+            b"--outer--\r\n"
+        )
+        with patch.object(File, "close", autospec=True) as mock_close:
+            with self.assertRaises(MultipartParseError):
+                self.feed(msg, chunk_size=1)
+        # The malformed nesting must close the file it left open, and the
+        # incomplete file must not be emitted.
+        self.assertEqual(mock_close.call_count, 1)
+        self.assertEqual(mock_close.call_args[0][0].file_name, b"a.txt")
+        self.assertEqual(self.files, [])
+
+    def test_nested_mixed_recursive(self) -> None:
+        # Nesting within the depth limit works; the innermost files keep the
+        # outermost field name.
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=mid\r\n"
+            b"\r\n"
+            b"--mid\r\n"
+            b'Content-Disposition: attachment; filename="x.txt"\r\n'
+            b"Content-Type: multipart/mixed; boundary=innermost\r\n"
+            b"\r\n"
+            b"--innermost\r\n"
+            b'Content-Disposition: attachment; filename="deep.txt"\r\n'
+            b"\r\n"
+            b"deep-data\r\n"
+            b"--innermost--\r\n"
+            b"--mid--\r\n"
+            b"--outer--\r\n"
+        )
+        self.feed(msg, chunk_size=1)
+        self.assertEqual(len(self.files), 1)
+        self.assertEqual(self.files[0].field_name, b"files")
+        self.assertEqual(self.files[0].file_name, b"deep.txt")
+        self.assertEqual(self.file_data(self.files[0]), b"deep-data")
+        self.assertTrue(self.ended)
+
+    def test_nested_mixed_depth_limit(self) -> None:
+        self.make(config={"MAX_NESTED_MULTIPART_DEPTH": 1})
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=mid\r\n"
+            b"\r\n"
+            b"--mid\r\n"
+            b'Content-Disposition: attachment; filename="x.txt"\r\n'
+            b"Content-Type: multipart/mixed; boundary=innermost\r\n"
+            b"\r\n"
+            b"--innermost\r\n"
+            b'Content-Disposition: attachment; filename="deep.txt"\r\n'
+            b"\r\n"
+            b"deep-data\r\n"
+            b"--innermost--\r\n"
+            b"--mid--\r\n"
+            b"--outer--\r\n"
+        )
+        with self.assertRaisesRegex(FormParserError, "Maximum nested multipart depth"):
+            self.feed(msg, chunk_size=1)
+        self.assertEqual(self.files, [])
+
+    def test_nested_mixed_missing_inner_boundary(self) -> None:
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed\r\n"
+            b"\r\n"
+            b"whatever\r\n"
+            b"--outer--\r\n"
+        )
+        with self.assertRaisesRegex(FormParserError, "no boundary"):
+            self.feed(msg)
+
+    def test_nested_mixed_unsupported_transfer_encoding(self) -> None:
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"\r\n"
+            b"whatever\r\n"
+            b"--outer--\r\n"
+        )
+        with self.assertRaisesRegex(FormParserError, "Unsupported Content-Transfer-Encoding"):
+            self.feed(msg)
+
+    def test_nested_mixed_malformed_closes_deep_files(self) -> None:
+        # A missing end marker two levels down must close the file left open
+        # at the deepest level.
+        self.make()
+        msg = (
+            b"--outer\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=mid\r\n"
+            b"\r\n"
+            b"--mid\r\n"
+            b'Content-Disposition: attachment; filename="x.txt"\r\n'
+            b"Content-Type: multipart/mixed; boundary=innermost\r\n"
+            b"\r\n"
+            b"--innermost\r\n"
+            b'Content-Disposition: attachment; filename="deep.txt"\r\n'
+            b"\r\n"
+            b"deep-data\r\n"
+            b"--outer--\r\n"
+        )
+        with patch.object(File, "close", autospec=True) as mock_close:
+            with self.assertRaises(MultipartParseError):
+                self.feed(msg, chunk_size=1)
+        self.assertEqual(mock_close.call_count, 1)
+        self.assertEqual(mock_close.call_args[0][0].file_name, b"deep.txt")
+        self.assertEqual(self.files, [])
+
+    def test_nested_mixed_disabled_by_default(self) -> None:
+        # Without the compat flag, a multipart/mixed sub-part stays an opaque
+        # field value and the default behavior is unchanged.
+        files: list[File] = []
+        fields: list[Field] = []
+        f = FormParser("multipart/form-data", fields.append, files.append, boundary=b"outer")
+        f.write(self.nested_message())
+        f.finalize()
+        self.assertEqual([file.file_name for file in files], [b"later.bin"])
+        self.assertEqual([field.field_name for field in fields], [b"files", b"comment"])
+        expected_value = (
+            b"--inner\r\n"
+            b'Content-Disposition: attachment; filename="a.txt"\r\n'
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"hello a\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: attachment; filename="b.txt"\r\n'
+            b"\r\n"
+            b"hello b\r\n"
+            b"--inner--"
+        )
+        self.assertEqual(fields[0].value, expected_value)
 
 
 @parametrize_class

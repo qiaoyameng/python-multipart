@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+* Add an explicit pause/resume protocol to `MultipartParser`: callbacks can call `pause()`, `write()` returns the exact number of consumed bytes, and the caller re-feeds the remainder after `resume()`.
 * Speed up querystring callback dispatch [#316](https://github.com/Kludex/python-multipart/pull/316).
 
 ## 0.0.32 (2026-06-04)

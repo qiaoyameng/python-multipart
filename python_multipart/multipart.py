@@ -1031,6 +1031,15 @@ class MultipartParser(BaseParser):
         max_size: The maximum size of body to parse.  Defaults to infinity - i.e. unbounded.
         max_header_count: The maximum number of headers allowed per part.
         max_header_size: The maximum size of a single header line (excluding the trailing CRLF).
+
+    The parser supports an explicit pause/resume protocol for flow control - for
+    example, when the receiving end writes uploaded files to a slow disk and
+    needs the producer to wait.  Any callback may call :meth:`pause`, after
+    which the parser stops consuming input at the next byte boundary and
+    :meth:`write` returns the exact number of bytes consumed.  The caller keeps
+    the unconsumed remainder of the chunk and re-feeds it after calling
+    :meth:`resume`.  Bytes already passed to a callback are never re-sent, and a
+    retained partial-boundary tail is preserved across the pause.
     """  # noqa: E501
 
     def __init__(
@@ -1063,6 +1072,13 @@ class MultipartParser(BaseParser):
         # Setup marks.  These are used to track the state of data received.
         self.marks: dict[str, int] = {}
 
+        # Pause/resume protocol state.  A callback may request a pause via
+        # pause(); the parser then stops consuming input at the next byte
+        # boundary.  _failed is set when a parse error or a callback exception
+        # escapes write(), after which the parser rejects any further use.
+        self._paused = False
+        self._failed = False
+
         # Save our boundary.
         if isinstance(boundary, str):  # pragma: no cover
             boundary = boundary.encode("latin-1")
@@ -1078,12 +1094,24 @@ class MultipartParser(BaseParser):
         attribute on the raised exception will be set to the offset of the byte
         in the input chunk that caused the error.
 
+        If a callback requested a pause (see :meth:`pause`), the parser stops
+        consuming input at the next byte boundary, and this method returns the
+        number of bytes consumed, which may be less than ``len(data)``.  The
+        caller must keep the unconsumed remainder and re-feed it, prefixed by
+        nothing else, after calling :meth:`resume`.  Calling this method while
+        the parser is paused raises a MultipartParseError.
+
         Args:
             data: The data to write to the parser.
 
         Returns:
-            The number of bytes written.
+            The number of bytes consumed.
         """
+        if self._failed:
+            raise MultipartParseError("Cannot write to a parser that is in a failed state")
+        if self._paused:
+            raise MultipartParseError("Parser is paused; call resume() before writing more data")
+
         # Handle sizing.
         data_len = len(data)
         if (self._current_size + data_len) > self.max_size:
@@ -1101,10 +1129,44 @@ class MultipartParser(BaseParser):
         l = 0
         try:
             l = self._internal_write(data, data_len)
+        except BaseException:
+            # A parse error or an exception from a callback (including one
+            # raised after requesting a pause) leaves the parser in a failed
+            # state: discard any pending pause request and reject further use.
+            self._paused = False
+            self._failed = True
+            raise
         finally:
             self._current_size += l
 
         return l
+
+    def pause(self) -> None:
+        """Request that the parser pause parsing.
+
+        This is intended to be called from within a callback - for example,
+        when the receiving end (such as a slow disk writer) needs the producer
+        to wait.  The pause takes effect at the next byte boundary: the
+        callback sequence for the current byte completes, after which
+        :meth:`write` returns the number of bytes consumed so far.  While
+        paused, :meth:`write` and :meth:`finalize` raise a MultipartParseError;
+        call :meth:`resume` and re-feed the unconsumed remainder to continue.
+        """
+        self._paused = True
+
+    def resume(self) -> None:
+        """Clear a previous pause request, allowing parsing to continue.
+
+        After resuming, the caller must re-feed the unconsumed remainder of
+        the last written chunk via :meth:`write`.  Resuming a parser that is
+        not paused is a no-op; it does not clear the failed state.
+        """
+        self._paused = False
+
+    @property
+    def paused(self) -> bool:
+        """Whether the parser is currently paused (see :meth:`pause`)."""
+        return self._paused
 
     def _internal_write(self, data: bytes, length: int) -> int:
         # Get values from locals.
@@ -1182,6 +1244,12 @@ class MultipartParser(BaseParser):
 
         # For each byte...
         while i < length:
+            # A callback may have requested a pause (see pause()).  Stop at
+            # this byte boundary: every byte before i has been fully processed,
+            # and the caller will re-feed the remainder after resume().
+            if self._paused:
+                break
+
             c = data[i]
 
             if state == MultipartState.START:
@@ -1523,6 +1591,26 @@ class MultipartParser(BaseParser):
             # Move to the next byte.
             i += 1
 
+        # If a callback requested a pause and input remains unconsumed, stop
+        # here without flushing: marked-but-unemitted data starts at or after
+        # position i, so rebase the marks onto the remaining buffer, which the
+        # caller re-feeds as data[i:] after resume().  Negative marks are
+        # boundary look-behind and thus buffer-independent; keep them as-is.
+        if self._paused and i < length:
+            for name, marked in self.marks.items():
+                if marked > 0:
+                    self.marks[name] = marked - i
+
+            # Save values to locals.
+            self.state = state
+            self.index = index
+            self.flags = flags
+            self._current_header_count = current_header_count
+            self._current_header_size = current_header_size
+
+            # Return the number of consumed bytes.
+            return i
+
         # We call our callbacks with any remaining data.  Note that we pass
         # the 'remaining' flag, which sets the mark back to 0 instead of
         # deleting it, if it's found.  This is because, if the mark is found
@@ -1549,10 +1637,20 @@ class MultipartParser(BaseParser):
     def finalize(self) -> None:
         """Finalize this parser, which signals to that we are finished parsing.
 
+        Raises a MultipartParseError if the parser is paused - the caller may
+        still be holding unconsumed input, so finalizing would silently treat
+        an incomplete message as complete - or if the parser is in a failed
+        state.
+
         Note: It does not currently, but in the future, it will verify that we
         are in the final state of the parser (i.e. the end of the multipart
         message is well-formed), and, if not, throw an error.
         """
+        if self._failed:
+            raise MultipartParseError("Cannot finalize a parser that is in a failed state")
+        if self._paused:
+            raise MultipartParseError("Cannot finalize a paused parser; resume() and write the remaining data first")
+
         # TODO: verify that we're in the state MultipartState.END, otherwise throw an
         # error or otherwise state that we're not finished parsing.
         pass

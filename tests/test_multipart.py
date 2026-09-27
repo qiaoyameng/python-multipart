@@ -36,7 +36,7 @@ from python_multipart.multipart import (
 from .compat import parametrize, parametrize_class
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Container, Iterable, Iterator
     from typing import Any, TypedDict
 
     from python_multipart.multipart import FileConfig
@@ -1628,6 +1628,313 @@ class TestFormParser(unittest.TestCase):
         self.assertEqual(calls, 3)
 
 
+class TestMultipartParserPauseResume(unittest.TestCase):
+    """Tests for the explicit pause/resume protocol of MultipartParser."""
+
+    boundary = b"boundary"
+    body = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="field"\r\n'
+        b"\r\n"
+        b"field-value\r\n"
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="file.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"content with --bound and\r\n"
+        b"--boundary-lookalike prefixes\r\n"
+        b"--boundary--\r\n"
+    )
+    all_callbacks = (
+        "part_begin",
+        "part_data",
+        "part_end",
+        "header_begin",
+        "header_field",
+        "header_value",
+        "header_end",
+        "headers_finished",
+        "end",
+    )
+
+    def make_parser(self, pause_on: Container[str] = ()) -> tuple[MultipartParser, list[tuple[str, bytes]]]:
+        """Create a parser recording events, pausing on the given callbacks."""
+        events: list[tuple[str, bytes]] = []
+        parser = MultipartParser(self.boundary)
+
+        def notify(name: str) -> Callable[[], None]:
+            def callback() -> None:
+                events.append((name, b""))
+                if name in pause_on:
+                    parser.pause()
+
+            return callback
+
+        def data(name: str) -> Callable[[bytes, int, int], None]:
+            def callback(chunk: bytes, start: int, end: int) -> None:
+                events.append((name, chunk[start:end]))
+                if name in pause_on:
+                    parser.pause()
+
+            return callback
+
+        parser.set_callback("part_begin", notify("part_begin"))
+        parser.set_callback("part_data", data("part_data"))
+        parser.set_callback("part_end", notify("part_end"))
+        parser.set_callback("header_begin", notify("header_begin"))
+        parser.set_callback("header_field", data("header_field"))
+        parser.set_callback("header_value", data("header_value"))
+        parser.set_callback("header_end", notify("header_end"))
+        parser.set_callback("headers_finished", notify("headers_finished"))
+        parser.set_callback("end", notify("end"))
+        return parser, events
+
+    @staticmethod
+    def feed(parser: MultipartParser, chunks: Iterable[bytes]) -> int:
+        """Feed chunks, honoring the pause/resume protocol; return the total consumed."""
+        written = 0
+        for chunk in chunks:
+            offset = 0
+            while offset < len(chunk) or parser.paused:
+                if parser.paused:
+                    # The slow consumer catches up here, then re-feeds the rest.
+                    parser.resume()
+                offset += parser.write(chunk[offset:])
+            written += offset
+        return written
+
+    @staticmethod
+    def normalize(events: list[tuple[str, bytes]]) -> list[tuple[str, bytes]]:
+        """Merge consecutive data events, so sequences compare chunking-independently."""
+        merged: list[tuple[str, bytes]] = []
+        for name, payload in events:
+            if payload and merged and merged[-1][0] == name:
+                merged[-1] = (name, merged[-1][1] + payload)
+            else:
+                merged.append((name, payload))
+        return merged
+
+    def baseline(self) -> list[tuple[str, bytes]]:
+        """The callback sequence of a single non-paused write of the whole body."""
+        parser, events = self.make_parser()
+        self.assertEqual(parser.write(self.body), len(self.body))
+        parser.finalize()
+        return self.normalize(events)
+
+    def test_pause_positions_and_chunk_sizes_match_baseline(self) -> None:
+        """Pausing at any callback, with any chunking, reproduces the callback
+        sequence of a non-paused parse."""
+        pause_positions: tuple[Container[str], ...] = (
+            ("part_data",),
+            ("header_begin",),
+            ("header_field",),
+            ("header_value",),
+            ("header_end",),
+            ("headers_finished",),
+            ("part_begin",),
+            ("part_end",),
+            ("end",),
+            self.all_callbacks,
+        )
+        baseline = self.baseline()
+        for chunk_size in (1, 2, 3, 5, 7, 13, 64, len(self.body)):
+            chunks = [self.body[i : i + chunk_size] for i in range(0, len(self.body), chunk_size)]
+            for pause_on in pause_positions:
+                parser, events = self.make_parser(pause_on=pause_on)
+                written = self.feed(parser, chunks)
+                parser.finalize()
+                self.assertEqual(written, len(self.body))
+                self.assertEqual(self.normalize(events), baseline, f"chunk_size={chunk_size} pause_on={pause_on}")
+
+    def test_multiple_pauses(self) -> None:
+        """A single chunk may be paused and resumed several times."""
+        parser, events = self.make_parser(pause_on={"part_data"})
+        pauses = 0
+        offset = 0
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                pauses += 1
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+        self.assertGreater(pauses, 1)
+        self.assertEqual(self.normalize(events), self.baseline())
+
+    def test_write_returns_exact_consumed_count(self) -> None:
+        """write() returns the position right after the pausing callback, and
+        no byte is delivered to a callback twice."""
+        parser, events = self.make_parser(pause_on={"headers_finished"})
+        n = parser.write(self.body)
+        self.assertTrue(parser.paused)
+        # The pause takes effect right after the first part's headers.
+        headers_end = self.body.index(b"\r\n\r\n") + 4
+        self.assertEqual(n, headers_end)
+        self.assertEqual(
+            [name for name, _ in events],
+            ["part_begin", "header_begin", "header_field", "header_value", "header_end", "headers_finished"],
+        )
+        # Resume and finish; the remainder is parsed exactly once.
+        parser.resume()
+        offset = n
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+        self.assertEqual(self.normalize(events), self.baseline())
+
+    def test_pause_in_middle_of_boundary_match(self) -> None:
+        """A chunk ending mid-boundary keeps its retained partial-boundary
+        tail across a pause."""
+        boundary_at = self.body.index(b"\r\n--boundary\r\n")
+        split = boundary_at + 5  # Inside the boundary.
+        parser, events = self.make_parser(pause_on={"part_data"})
+        n = parser.write(self.body[:split])
+        self.assertEqual(n, split)
+        self.assertTrue(parser.paused)
+        parser.resume()
+        offset = split
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+        self.assertEqual(self.normalize(events), self.baseline())
+
+    def test_empty_write(self) -> None:
+        """Empty writes consume nothing and do not disturb the parser."""
+        parser, events = self.make_parser()
+        self.assertEqual(parser.write(b""), 0)
+        self.assertEqual(events, [])
+        first, rest = self.body[:10], self.body[10:]
+        self.assertEqual(parser.write(first), len(first))
+        self.assertEqual(parser.write(b""), 0)
+        self.assertEqual(parser.write(rest), len(rest))
+        parser.finalize()
+        self.assertEqual(self.normalize(events), self.baseline())
+
+    def test_empty_write_after_resume(self) -> None:
+        """An empty write is allowed (and consumes nothing) once resumed."""
+        parser, events = self.make_parser(pause_on={"part_data"})
+        n = parser.write(self.body)
+        self.assertTrue(parser.paused)
+        parser.resume()
+        self.assertEqual(parser.write(b""), 0)
+        offset = n
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+        self.assertEqual(self.normalize(events), self.baseline())
+
+    def test_write_while_paused_raises(self) -> None:
+        """Writing without resuming first is a protocol violation."""
+        parser, _ = self.make_parser(pause_on={"headers_finished"})
+        n = parser.write(self.body)
+        self.assertTrue(parser.paused)
+        self.assertLess(n, len(self.body))
+        with self.assertRaises(MultipartParseError):
+            parser.write(self.body[n:])
+        with self.assertRaises(MultipartParseError):
+            parser.write(b"")
+        # Resuming twice is fine; the second resume is a no-op.
+        parser.resume()
+        parser.resume()
+        self.assertFalse(parser.paused)
+        offset = n
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+
+    def test_finalize_while_paused_raises(self) -> None:
+        """finalize() must not silently complete while input is unconsumed."""
+        parser, _ = self.make_parser(pause_on={"part_data"})
+        n = parser.write(self.body)
+        self.assertTrue(parser.paused)
+        self.assertLess(n, len(self.body))
+        with self.assertRaises(MultipartParseError):
+            parser.finalize()
+        # After resuming and feeding the remainder, finalize works.
+        parser.resume()
+        offset = n
+        while offset < len(self.body) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(self.body[offset:])
+        self.assertEqual(offset, len(self.body))
+        parser.finalize()
+
+    def test_callback_raises_after_pause(self) -> None:
+        """A callback raising after requesting a pause leaves a clear error
+        state: not paused, and further use is rejected."""
+        parser = MultipartParser(self.boundary)
+
+        def on_part_data(data: bytes, start: int, end: int) -> None:
+            parser.pause()
+            raise ValueError("boom")
+
+        parser.set_callback("part_data", on_part_data)
+        with self.assertRaises(ValueError):
+            parser.write(self.body)
+        self.assertFalse(parser.paused)
+        with self.assertRaises(MultipartParseError):
+            parser.write(b"more")
+        with self.assertRaises(MultipartParseError):
+            parser.finalize()
+
+    def test_bad_boundary_after_resume(self) -> None:
+        """A parse error after a resume is reported and fails the parser."""
+        parser, _ = self.make_parser(pause_on={"part_begin"})
+        first = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="field"\r\n'
+            b"\r\n"
+            b"field-value\r\n"
+            b"--boundary\r\n"
+        )
+        offset = 0
+        while offset < len(first) or parser.paused:
+            if parser.paused:
+                parser.resume()
+            offset += parser.write(first[offset:])
+        self.assertEqual(offset, len(first))
+        # A boundary line shows up where the parser expects part headers.
+        with self.assertRaises(MultipartParseError):
+            parser.write(b"--boundary--\r\n")
+        self.assertFalse(parser.paused)
+        with self.assertRaises(MultipartParseError):
+            parser.write(b"more")
+        with self.assertRaises(MultipartParseError):
+            parser.finalize()
+
+    def test_boundary_prefix_in_file_content(self) -> None:
+        """Part data containing boundary prefixes survives pause/resume intact."""
+        content = b"prefix --bound middle\r\n" b"--boundary-suffix\r\n" b"--boundaryX more\r\n" b"end"
+        header = b"--boundary\r\n" b'Content-Disposition: form-data; name="file"; filename="f.txt"\r\n' b"\r\n"
+        body = header + content + b"\r\n--boundary--\r\n"
+        for chunk_size in (1, 2, 3, 5, len(body)):
+            parser = MultipartParser(self.boundary)
+            chunks_out: list[bytes] = []
+
+            def on_part_data(data: bytes, start: int, end: int) -> None:
+                chunks_out.append(data[start:end])
+                parser.pause()
+
+            parser.set_callback("part_data", on_part_data)
+            chunks = [body[i : i + chunk_size] for i in range(0, len(body), chunk_size)]
+            self.assertEqual(self.feed(parser, chunks), len(body))
+            parser.finalize()
+            self.assertEqual(b"".join(chunks_out), content, f"chunk_size={chunk_size}")
+
+
 @parametrize_class
 class TestHelperFunctions(unittest.TestCase):
     def test_create_form_parser(self) -> None:
@@ -1700,6 +2007,7 @@ def suite() -> unittest.TestSuite:
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestBase64Decoder))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestQuotedPrintableDecoder))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestFormParser))
+    suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestMultipartParserPauseResume))
     suite.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(TestHelperFunctions))
 
     return suite

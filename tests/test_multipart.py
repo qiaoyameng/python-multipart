@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import yaml
@@ -1626,6 +1626,264 @@ class TestFormParser(unittest.TestCase):
         # Assert that we called our 'header_begin' callback three times; once
         # for each header in the multipart message.
         self.assertEqual(calls, 3)
+
+
+class TestNestedMultipartCompat(unittest.TestCase):
+    """Tests for the opt-in legacy multipart/mixed compatibility mode.
+
+    Some legacy systems wrap several attachments of a single field in a
+    ``multipart/mixed`` sub-part.  With ``NESTED_MULTIPART_COMPAT`` enabled,
+    the FormParser parses such container parts with a nested parser, emitting
+    the inner files one by one under the outer field name.
+    """
+
+    BASIC_BODY = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="files"\r\n'
+        b"Content-Type: multipart/mixed; boundary=inner-boundary\r\n"
+        b"\r\n"
+        b"--inner-boundary\r\n"
+        b'Content-Disposition: form-data; name="ignored-inner-name"; filename="a.txt"\r\n'
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"first file\r\n"
+        b"--inner-boundary\r\n"
+        b'Content-Disposition: form-data; filename="b.txt"\r\n'
+        b"\r\n"
+        b"second file\r\n"
+        b"--inner-boundary--\r\n"
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="comment"\r\n'
+        b"\r\n"
+        b"hello world\r\n"
+        b"--boundary--\r\n"
+    )
+
+    DOUBLE_NESTED_BODY = (
+        b"--boundary\r\n"
+        b'Content-Disposition: form-data; name="files"\r\n'
+        b"Content-Type: multipart/mixed; boundary=mid\r\n"
+        b"\r\n"
+        b"--mid\r\n"
+        b'Content-Disposition: form-data; name="files"\r\n'
+        b"Content-Type: multipart/mixed; boundary=inner\r\n"
+        b"\r\n"
+        b"--inner\r\n"
+        b'Content-Disposition: form-data; filename="a.txt"\r\n'
+        b"\r\n"
+        b"deep data\r\n"
+        b"--inner--\r\n"
+        b"--mid--\r\n"
+        b"--boundary--\r\n"
+    )
+
+    def make(self, boundary: bytes = b"boundary", config: dict[str, Any] = {}) -> None:
+        self.ended = False
+        self.files: list[File] = []
+        self.fields: list[Field] = []
+
+        def on_end() -> None:
+            self.ended = True
+
+        cfg: dict[str, Any] = {"NESTED_MULTIPART_COMPAT": True}
+        cfg.update(config)
+        self.parser = FormParser(
+            "multipart/form-data", self.fields.append, self.files.append, on_end, boundary=boundary, config=cfg
+        )
+
+    def feed(self, data: bytes, chunk_size: int | None = None) -> None:
+        if chunk_size is None:
+            self.parser.write(data)
+        else:
+            for x in range(0, len(data), chunk_size):
+                self.parser.write(data[x : x + chunk_size])
+        self.parser.finalize()
+
+    def file_contents(self) -> list[bytes]:
+        contents = []
+        for f in self.files:
+            f.file_object.seek(0)
+            contents.append(f.file_object.read())
+        return contents
+
+    def assert_basic_body(self) -> None:
+        # Both inner files are reported under the *outer* field name, even
+        # though the first inner part carries a different name of its own.
+        self.assertEqual([f.field_name for f in self.files], [b"files", b"files"])
+        self.assertEqual([f.file_name for f in self.files], [b"a.txt", b"b.txt"])
+        self.assertEqual(self.file_contents(), [b"first file", b"second file"])
+        # The normal field after the container part is still parsed.
+        self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"comment", b"hello world")])
+        self.assertTrue(self.ended)
+
+    def test_nested_mixed_streams_inner_files(self) -> None:
+        self.make()
+        self.feed(self.BASIC_BODY)
+        self.assert_basic_body()
+
+    def test_inner_files_emitted_incrementally(self) -> None:
+        # The first inner file is emitted before the parent part has ended:
+        # the parent part is never buffered as a whole.
+        self.make()
+        split = self.BASIC_BODY.index(b"second file")
+        self.parser.write(self.BASIC_BODY[:split])
+        self.assertEqual([f.file_name for f in self.files], [b"a.txt"])
+        self.parser.write(self.BASIC_BODY[split:])
+        self.parser.finalize()
+        self.assert_basic_body()
+
+    def test_nested_mixed_single_byte_feed(self) -> None:
+        self.make()
+        self.feed(self.BASIC_BODY, chunk_size=1)
+        self.assert_basic_body()
+
+    def test_nested_mixed_all_two_chunk_splits(self) -> None:
+        for first, last in split_all(self.BASIC_BODY):
+            self.make()
+            self.parser.write(first)
+            self.parser.write(last)
+            self.parser.finalize()
+            self.assert_basic_body()
+
+    def test_empty_inner_part(self) -> None:
+        body = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: form-data; name="files"; filename="empty.txt"\r\n'
+            b"\r\n"
+            b"\r\n"
+            b"--inner--\r\n"
+            b"--boundary--\r\n"
+        )
+        self.make()
+        self.feed(body)
+        self.assertEqual([f.file_name for f in self.files], [b"empty.txt"])
+        self.assertEqual(self.file_contents(), [b""])
+        self.assertEqual(self.files[0].size, 0)
+        self.assertTrue(self.ended)
+
+    def test_empty_container_part(self) -> None:
+        body = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner--\r\n"
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="after"\r\n'
+            b"\r\n"
+            b"value\r\n"
+            b"--boundary--\r\n"
+        )
+        self.make()
+        self.feed(body)
+        self.assertEqual(self.files, [])
+        self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"after", b"value")])
+        self.assertTrue(self.ended)
+
+    def test_common_boundary_prefix(self) -> None:
+        # The inner boundary starts with the outer boundary: the outer parser
+        # must not mistake inner delimiters for its own.
+        body = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=boundary-inner\r\n"
+            b"\r\n"
+            b"--boundary-inner\r\n"
+            b'Content-Disposition: form-data; filename="a.txt"\r\n'
+            b"\r\n"
+            b"alpha\r\n"
+            b"--boundary-inner\r\n"
+            b'Content-Disposition: form-data; filename="b.txt"\r\n'
+            b"\r\n"
+            b"beta\r\n"
+            b"--boundary-inner--\r\n"
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="tail"\r\n'
+            b"\r\n"
+            b"done\r\n"
+            b"--boundary--\r\n"
+        )
+        for chunk_size in (None, 1):
+            self.make()
+            self.feed(body, chunk_size=chunk_size)
+            self.assertEqual([f.field_name for f in self.files], [b"files", b"files"])
+            self.assertEqual(self.file_contents(), [b"alpha", b"beta"])
+            self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"tail", b"done")])
+            self.assertTrue(self.ended)
+
+    def test_missing_inner_closing_boundary(self) -> None:
+        # The inner multipart never terminates: the still-open inner file is
+        # closed and discarded, and parsing of the outer message continues.
+        body = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n"
+            b"\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: form-data; filename="a.txt"\r\n'
+            b"\r\n"
+            b"complete\r\n"
+            b"--inner\r\n"
+            b'Content-Disposition: form-data; filename="b.txt"\r\n'
+            b"\r\n"
+            b"truncated\r\n"
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="after"\r\n'
+            b"\r\n"
+            b"still parsed\r\n"
+            b"--boundary--\r\n"
+        )
+        self.make()
+        with patch.object(File, "close", autospec=True) as close_spy:
+            self.feed(body)
+        # The completed inner file is kept; the truncated one is closed and
+        # discarded.
+        self.assertEqual([f.file_name for f in self.files], [b"a.txt"])
+        close_spy.assert_called_once()
+        self.assertEqual(close_spy.call_args[0][0].file_name, b"b.txt")
+        # Subsequent outer fields are still parsed.
+        self.assertEqual([(f.field_name, f.value) for f in self.fields], [(b"after", b"still parsed")])
+        self.assertTrue(self.ended)
+
+    def test_default_mode_treats_container_as_opaque_field(self) -> None:
+        # Without the opt-in, a multipart/mixed part is parsed as a regular
+        # field holding the raw sub-part body (default behavior unchanged).
+        self.assertFalse(FormParser.DEFAULT_CONFIG["NESTED_MULTIPART_COMPAT"])
+        self.make(config={"NESTED_MULTIPART_COMPAT": False})
+        self.feed(self.BASIC_BODY)
+        self.assertEqual(self.files, [])
+        self.assertEqual([f.field_name for f in self.fields], [b"files", b"comment"])
+        expected = (
+            b"--inner-boundary\r\n"
+            b'Content-Disposition: form-data; name="ignored-inner-name"; filename="a.txt"\r\n'
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"first file\r\n"
+            b"--inner-boundary\r\n"
+            b'Content-Disposition: form-data; filename="b.txt"\r\n'
+            b"\r\n"
+            b"second file\r\n"
+            b"--inner-boundary--"
+        )
+        self.assertEqual(self.fields[0].value, expected)
+        self.assertEqual(self.fields[1].value, b"hello world")
+        self.assertTrue(self.ended)
+
+    def test_double_nesting_within_depth_limit(self) -> None:
+        self.make()
+        self.feed(self.DOUBLE_NESTED_BODY)
+        self.assertEqual([f.field_name for f in self.files], [b"files"])
+        self.assertEqual(self.file_contents(), [b"deep data"])
+        self.assertTrue(self.ended)
+
+    def test_nesting_depth_limit_exceeded(self) -> None:
+        self.make(config={"MAX_NESTED_MULTIPART_DEPTH": 1})
+        with self.assertRaisesRegex(FormParserError, "Maximum nested multipart depth"):
+            self.parser.write(self.DOUBLE_NESTED_BODY)
 
 
 @parametrize_class
